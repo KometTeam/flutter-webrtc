@@ -16,6 +16,8 @@ export 'src/native/rtc_video_view_impl.dart'
     if (dart.library.js_interop) 'src/web/rtc_video_view_impl.dart';
 export 'src/native/utils.dart'
     if (dart.library.js_interop) 'src/web/utils.dart';
+export 'src/native/video_frame_tap.dart'
+    if (dart.library.js_interop) 'src/web/video_frame_tap.dart';
 export 'src/native/adapter_type.dart';
 export 'src/native/camera_utils.dart';
 export 'src/native/audio_management.dart';

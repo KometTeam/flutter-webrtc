@@ -17,7 +17,8 @@ FlutterWebRTC::FlutterWebRTC(FlutterWebRTCPlugin* plugin)
       FlutterScreenCapture::FlutterScreenCapture(this),
       FlutterDataChannel::FlutterDataChannel(this),
       FlutterFrameCryptor::FlutterFrameCryptor(this),
-      FlutterDataPacketCryptor::FlutterDataPacketCryptor(this) {}
+      FlutterDataPacketCryptor::FlutterDataPacketCryptor(this),
+      FlutterFrameTap::FlutterFrameTap(this) {}
 
 FlutterWebRTC::~FlutterWebRTC() {}
 
@@ -1006,6 +1007,26 @@ void FlutterWebRTC::HandleMethodCall(
       return;
     }
     SetConfiguration(pc, configuration, std::move(result));
+  } else if (method_call.method_name().compare("videoTrackStartFrameTap") ==
+             0) {
+    if (!method_call.arguments()) {
+      result->Error("Bad Arguments", "Null constraints arguments received");
+      return;
+    }
+    const EncodableMap params =
+        GetValue<EncodableMap>(*method_call.arguments());
+    StartFrameTap(findString(params, "trackId"), findString(params, "format"),
+                  findInt(params, "maxFps"), findInt(params, "maxWidth"),
+                  findInt(params, "maxHeight"), std::move(result));
+  } else if (method_call.method_name().compare("videoTrackStopFrameTap") ==
+             0) {
+    if (!method_call.arguments()) {
+      result->Error("Bad Arguments", "Null constraints arguments received");
+      return;
+    }
+    const EncodableMap params =
+        GetValue<EncodableMap>(*method_call.arguments());
+    StopFrameTap(findString(params, "tapId"), std::move(result));
   } else if (method_call.method_name().compare("captureFrame") == 0) {
     if (!method_call.arguments()) {
       result->Error("Bad Arguments", "Null constraints arguments received");

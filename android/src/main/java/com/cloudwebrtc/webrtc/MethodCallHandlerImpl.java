@@ -44,6 +44,7 @@ import com.cloudwebrtc.webrtc.video.VideoCapturerInfo;
 import com.cloudwebrtc.webrtc.video.camera.CameraUtils;
 import com.cloudwebrtc.webrtc.video.camera.Point;
 import com.cloudwebrtc.webrtc.video.LocalVideoTrack;
+import com.cloudwebrtc.webrtc.video.VideoFrameTap;
 import com.twilio.audioswitch.AudioDevice;
 
 import org.webrtc.AudioTrack;
@@ -114,6 +115,7 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
   private PeerConnectionFactory mFactory;
   private final Map<String, MediaStream> localStreams = new HashMap<>();
   private final Map<String, LocalTrack> localTracks = new HashMap<>();
+  private final Map<String, VideoFrameTap> frameTaps = new HashMap<>();
   private final LongSparseArray<FlutterRTCVideoRenderer> renders = new LongSparseArray<>();
 
   public RecordSamplesReadyCallbackAdapter recordSamplesReadyCallbackAdapter;
@@ -886,6 +888,49 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
         String albumName = call.argument("albumName");
         getUserMediaImpl.stopRecording(recorderId, albumName, () -> result.success(null));
         break;
+      case "videoTrackStartFrameTap": {
+        String trackId = call.argument("trackId");
+        String format = call.argument("format");
+        MediaStreamTrack track = trackId == null ? null : getTrackForId(trackId, null);
+        if (!(track instanceof VideoTrack)) {
+          resultError("videoTrackStartFrameTap", "video track not found", result);
+          break;
+        }
+        if (!"vp8".equals(format)) {
+          resultError("videoTrackStartFrameTap",
+              "format " + format + " is not supported on Android", result);
+          break;
+        }
+        String tapId = UUID.randomUUID().toString();
+        frameTaps.put(tapId, new VideoFrameTap(
+            messenger,
+            tapId,
+            (VideoTrack) track,
+            intArgument(call, "maxFps", 10),
+            intArgument(call, "maxWidth", 1920),
+            intArgument(call, "maxHeight", 1080),
+            intArgument(call, "bitrateKbps", 2000)));
+        Map<String, Object> params = new HashMap<>();
+        params.put("tapId", tapId);
+        result.success(params);
+        break;
+      }
+      case "videoTrackFrameTapRequestKeyFrame": {
+        VideoFrameTap tap = frameTaps.get(call.<String>argument("tapId"));
+        if (tap != null) {
+          tap.requestKeyFrame();
+        }
+        result.success(null);
+        break;
+      }
+      case "videoTrackStopFrameTap": {
+        VideoFrameTap tap = frameTaps.remove(call.<String>argument("tapId"));
+        if (tap != null) {
+          tap.dispose();
+        }
+        result.success(null);
+        break;
+      }
       case "captureFrame": {
         String path = call.argument("path");
         String videoTrackId = call.argument("trackId");
@@ -1615,6 +1660,11 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     }
 
     return stream;
+  }
+
+  private static int intArgument(MethodCall call, String key, int fallback) {
+    Integer value = call.argument(key);
+    return value != null && value > 0 ? value : fallback;
   }
 
   public MediaStreamTrack getTrackForId(String trackId, String peerConnectionId) {
