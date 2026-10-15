@@ -1,13 +1,8 @@
 #include "flutter_media_stream.h"
 
+#include "flutter_serial_thread.h"
 #include "flutter_utf8_sanitize.h"
 #include "task_runner.h"
-
-#include <condition_variable>
-#include <deque>
-#include <functional>
-#include <mutex>
-#include <thread>
 
 #define DEFAULT_WIDTH 1280
 #define DEFAULT_HEIGHT 720
@@ -35,46 +30,6 @@ std::string SanitizeDeviceIdFromVideoBuffers(const char* name, const char* guid)
   return SanitizeUtf8ForFlutter(raw);
 }
 
-// Opening or stopping a camera blocks for a second or more (V4L2 STREAMON,
-// DirectShow graph start). On Linux the window is drawn on the platform
-// thread, so doing it there freezes the whole UI. Camera work runs on one
-// serial thread instead, which also keeps stop-then-open on the same device
-// in order. The thread is intentionally never joined.
-class CameraThread {
- public:
-  static CameraThread& Instance() {
-    static CameraThread* instance = new CameraThread();
-    return *instance;
-  }
-
-  void Post(std::function<void()> task) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      tasks_.push_back(std::move(task));
-    }
-    wake_.notify_one();
-  }
-
- private:
-  CameraThread() { std::thread([this] { Run(); }).detach(); }
-
-  void Run() {
-    for (;;) {
-      std::function<void()> task;
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        wake_.wait(lock, [this] { return !tasks_.empty(); });
-        task = std::move(tasks_.front());
-        tasks_.pop_front();
-      }
-      task();
-    }
-  }
-
-  std::mutex mutex_;
-  std::condition_variable wake_;
-  std::deque<std::function<void()>> tasks_;
-};
 
 }  // namespace
 
@@ -133,7 +88,7 @@ void FlutterMediaStream::GetUserMedia(
   CameraRequest request = ParseCameraRequest(constraints);
   std::shared_ptr<MethodResultProxy> pending(std::move(result));
   FlutterWebRTCBase* base = base_;
-  CameraThread::Instance().Post(
+  SerialThread::Camera().Post(
       [this, base, request, stream, params, uuid, pending]() {
         OpenedCamera camera = OpenCamera(request);
         base->task_runner_->EnqueueTask(
@@ -527,7 +482,7 @@ void FlutterMediaStream::StopCapture(scoped_refptr<RTCVideoCapturer> capturer) {
     }
     return;
   }
-  CameraThread::Instance().Post([capturer]() {
+  SerialThread::Camera().Post([capturer]() {
     if (capturer->CaptureStarted()) {
       capturer->StopCapture();
     }

@@ -3,6 +3,8 @@
 #include "base/scoped_ref_ptr.h"
 #include "flutter_data_channel.h"
 #include "flutter_frame_capturer.h"
+#include "flutter_serial_thread.h"
+#include "task_runner.h"
 #include "rtc_dtmf_sender.h"
 #include "rtc_rtp_parameters.h"
 
@@ -1031,74 +1033,77 @@ EncodableMap statsToMap(const scoped_refptr<MediaRTCStats>& stats) {
   return report_map;
 }
 
+namespace {
+
+void PostResult(TaskRunner* task_runner, std::function<void()> deliver) {
+  if (task_runner != nullptr) {
+    task_runner->EnqueueTask(std::move(deliver));
+  } else {
+    deliver();
+  }
+}
+
+}  // namespace
+
+// Stats collection blocks on libwebrtc's worker thread, which is busy for a
+// second or more while a camera starts. Collecting on the platform thread
+// froze the window every time a call polled stats during that time, so it
+// runs on a background thread and the reply is posted back.
 void FlutterPeerConnection::GetStats(
     const std::string& track_id,
     RTCPeerConnection* pc,
     std::unique_ptr<MethodResultProxy> result) {
   std::shared_ptr<MethodResultProxy> result_ptr(result.release());
+  TaskRunner* task_runner = base_->task_runner_;
+  OnStatsCollectorSuccess on_success =
+      [result_ptr,
+       task_runner](const vector<scoped_refptr<MediaRTCStats>> reports) {
+        EncodableList list;
+        for (int i = 0; i < reports.size(); i++) {
+          list.push_back(EncodableValue(statsToMap(reports[i])));
+        }
+        EncodableMap params;
+        params[EncodableValue("stats")] = EncodableValue(list);
+        EncodableValue value(params);
+        PostResult(task_runner,
+                   [result_ptr, value]() { result_ptr->Success(value); });
+      };
+  OnStatsCollectorFailure on_failure = [result_ptr,
+                                        task_runner](const char* error) {
+    std::string message(error != nullptr ? error : "");
+    PostResult(task_runner, [result_ptr, message]() {
+      result_ptr->Error("GetStats", message);
+    });
+  };
+
+  scoped_refptr<RTCPeerConnection> peer(pc);
   scoped_refptr<RTCMediaTrack> track = base_->MediaTracksForId(track_id);
-  if (track != nullptr && track_id != "") {
-    bool found = false;
-    auto receivers = pc->receivers();
+  bool by_track = track != nullptr && track_id != "";
+  SerialThread::Stats().Post([peer, by_track, track_id, on_success,
+                              on_failure, result_ptr, task_runner]() {
+    if (!by_track) {
+      peer->GetStats(on_success, on_failure);
+      return;
+    }
+    auto receivers = peer->receivers();
     for (auto receiver : receivers.std_vector()) {
-      if (receiver->track() && receiver->track()->id().c_string() == track_id) {
-        found = true;
-        pc->GetStats(
-            receiver,
-            [result_ptr](const vector<scoped_refptr<MediaRTCStats>> reports) {
-              EncodableList list;
-              for (int i = 0; i < reports.size(); i++) {
-                list.push_back(EncodableValue(statsToMap(reports[i])));
-              }
-              EncodableMap params;
-              params[EncodableValue("stats")] = EncodableValue(list);
-              result_ptr->Success(EncodableValue(params));
-            },
-            [result_ptr](const char* error) {
-              result_ptr->Error("GetStats", error);
-            });
+      if (receiver->track() &&
+          receiver->track()->id().c_string() == track_id) {
+        peer->GetStats(receiver, on_success, on_failure);
         return;
       }
     }
-    auto senders = pc->senders();
+    auto senders = peer->senders();
     for (auto sender : senders.std_vector()) {
       if (sender->track() && sender->track()->id().c_string() == track_id) {
-        found = true;
-        pc->GetStats(
-            sender,
-            [result_ptr](const vector<scoped_refptr<MediaRTCStats>> reports) {
-              EncodableList list;
-              for (int i = 0; i < reports.size(); i++) {
-                list.push_back(EncodableValue(statsToMap(reports[i])));
-              }
-              EncodableMap params;
-              params[EncodableValue("stats")] = EncodableValue(list);
-              result_ptr->Success(EncodableValue(params));
-            },
-            [result_ptr](const char* error) {
-              result_ptr->Error("GetStats", error);
-            });
+        peer->GetStats(sender, on_success, on_failure);
         return;
       }
     }
-    if (!found) {
+    PostResult(task_runner, [result_ptr]() {
       result_ptr->Error("GetStats", "Track not found");
-    }
-  } else {
-    pc->GetStats(
-        [result_ptr](const vector<scoped_refptr<MediaRTCStats>> reports) {
-          EncodableList list;
-          for (int i = 0; i < reports.size(); i++) {
-            list.push_back(EncodableValue(statsToMap(reports[i])));
-          }
-          EncodableMap params;
-          params[EncodableValue("stats")] = EncodableValue(list);
-          result_ptr->Success(EncodableValue(params));
-        },
-        [result_ptr](const char* error) {
-          result_ptr->Error("GetStats", error);
-        });
-  }
+    });
+  });
 }
 
 void FlutterPeerConnection::MediaStreamAddTrack(
