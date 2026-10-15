@@ -1,6 +1,13 @@
 #include "flutter_media_stream.h"
 
 #include "flutter_utf8_sanitize.h"
+#include "task_runner.h"
+
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 #define DEFAULT_WIDTH 1280
 #define DEFAULT_HEIGHT 720
@@ -27,6 +34,47 @@ std::string SanitizeDeviceIdFromVideoBuffers(const char* name, const char* guid)
                               : std::string(name != nullptr ? name : "");
   return SanitizeUtf8ForFlutter(raw);
 }
+
+// Opening or stopping a camera blocks for a second or more (V4L2 STREAMON,
+// DirectShow graph start). On Linux the window is drawn on the platform
+// thread, so doing it there freezes the whole UI. Camera work runs on one
+// serial thread instead, which also keeps stop-then-open on the same device
+// in order. The thread is intentionally never joined.
+class CameraThread {
+ public:
+  static CameraThread& Instance() {
+    static CameraThread* instance = new CameraThread();
+    return *instance;
+  }
+
+  void Post(std::function<void()> task) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      tasks_.push_back(std::move(task));
+    }
+    wake_.notify_one();
+  }
+
+ private:
+  CameraThread() { std::thread([this] { Run(); }).detach(); }
+
+  void Run() {
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        wake_.wait(lock, [this] { return !tasks_.empty(); });
+        task = std::move(tasks_.front());
+        tasks_.pop_front();
+      }
+      task();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::deque<std::function<void()>> tasks_;
+};
 
 }  // namespace
 
@@ -66,19 +114,36 @@ void FlutterMediaStream::GetUserMedia(
 
   it = constraints.find(EncodableValue("video"));
   params[EncodableValue("videoTracks")] = EncodableValue(EncodableList());
+  bool wants_video = false;
   if (it != constraints.end()) {
     EncodableValue video = it->second;
-    if (TypeIs<bool>(video)) {
-      if (true == GetValue<bool>(video)) {
-        GetUserVideo(constraints, stream, params);
-      }
-    } else if (TypeIs<EncodableMap>(video)) {
-      GetUserVideo(constraints, stream, params);
-    }
+    wants_video = (TypeIs<bool>(video) && GetValue<bool>(video)) ||
+                  TypeIs<EncodableMap>(video);
   }
 
-  base_->local_streams_[uuid] = stream;
-  result->Success(EncodableValue(params));
+  if (!wants_video || base_->task_runner_ == nullptr) {
+    if (wants_video) {
+      GetUserVideo(constraints, stream, params);
+    }
+    base_->local_streams_[uuid] = stream;
+    result->Success(EncodableValue(params));
+    return;
+  }
+
+  CameraRequest request = ParseCameraRequest(constraints);
+  std::shared_ptr<MethodResultProxy> pending(std::move(result));
+  FlutterWebRTCBase* base = base_;
+  CameraThread::Instance().Post(
+      [this, base, request, stream, params, uuid, pending]() {
+        OpenedCamera camera = OpenCamera(request);
+        base->task_runner_->EnqueueTask(
+            [this, base, request, camera, stream, params, uuid,
+             pending]() mutable {
+              AttachCamera(request, camera, stream, params);
+              base->local_streams_[uuid] = stream;
+              pending->Success(EncodableValue(params));
+            });
+      });
 }
 
 void addDefaultAudioConstraints(
@@ -324,23 +389,28 @@ EncodableValue getConstrainInt(const EncodableMap& constraints,
 void FlutterMediaStream::GetUserVideo(const EncodableMap& constraints,
                                       scoped_refptr<RTCMediaStream> stream,
                                       EncodableMap& params) {
-  EncodableMap video_constraints;
+  CameraRequest request = ParseCameraRequest(constraints);
+  AttachCamera(request, OpenCamera(request), stream, params);
+}
+
+FlutterMediaStream::CameraRequest FlutterMediaStream::ParseCameraRequest(
+    const EncodableMap& constraints) {
+  CameraRequest request;
   EncodableMap video_mandatory;
   auto it = constraints.find(EncodableValue("video"));
   if (it != constraints.end() && TypeIs<EncodableMap>(it->second)) {
-    video_constraints = GetValue<EncodableMap>(it->second);
-    if (video_constraints.find(EncodableValue("mandatory")) !=
-        video_constraints.end()) {
+    request.video_constraints = GetValue<EncodableMap>(it->second);
+    if (request.video_constraints.find(EncodableValue("mandatory")) !=
+        request.video_constraints.end()) {
       video_mandatory = GetValue<EncodableMap>(
-          video_constraints.find(EncodableValue("mandatory"))->second);
+          request.video_constraints.find(EncodableValue("mandatory"))->second);
     }
   }
 
-  std::string facing_mode = getFacingMode(video_constraints);
-  // bool isFacing = facing_mode == "" || facing_mode != "environment";
-  std::string sourceId = getSourceIdConstraint(video_constraints);
+  request.source_id = getSourceIdConstraint(request.video_constraints);
 
-  EncodableValue widthValue = getConstrainInt(video_constraints, "width");
+  EncodableValue widthValue =
+      getConstrainInt(request.video_constraints, "width");
 
   if (widthValue == EncodableValue())
     widthValue = findEncodableValue(video_mandatory, "minWidth");
@@ -348,7 +418,8 @@ void FlutterMediaStream::GetUserVideo(const EncodableMap& constraints,
   if (widthValue == EncodableValue())
     widthValue = findEncodableValue(video_mandatory, "width");
 
-  EncodableValue heightValue = getConstrainInt(video_constraints, "height");
+  EncodableValue heightValue =
+      getConstrainInt(request.video_constraints, "height");
 
   if (heightValue == EncodableValue())
     heightValue = findEncodableValue(video_mandatory, "minHeight");
@@ -356,7 +427,8 @@ void FlutterMediaStream::GetUserVideo(const EncodableMap& constraints,
   if (heightValue == EncodableValue())
     heightValue = findEncodableValue(video_mandatory, "height");
 
-  EncodableValue fpsValue = getConstrainInt(video_constraints, "frameRate");
+  EncodableValue fpsValue =
+      getConstrainInt(request.video_constraints, "frameRate");
 
   if (fpsValue == EncodableValue())
     fpsValue = findEncodableValue(video_mandatory, "minFrameRate");
@@ -364,45 +436,60 @@ void FlutterMediaStream::GetUserVideo(const EncodableMap& constraints,
   if (fpsValue == EncodableValue())
     fpsValue = findEncodableValue(video_mandatory, "frameRate");
 
-  scoped_refptr<RTCVideoCapturer> video_capturer;
+  request.width = toInt(widthValue, DEFAULT_WIDTH);
+  request.height = toInt(heightValue, DEFAULT_HEIGHT);
+  request.fps = toInt(fpsValue, DEFAULT_FPS);
+  return request;
+}
+
+FlutterMediaStream::OpenedCamera FlutterMediaStream::OpenCamera(
+    const CameraRequest& request) {
+  OpenedCamera camera;
+  camera.source_id = request.source_id;
   char strNameUTF8[256];
   char strGuidUTF8[256];
   int nb_video_devices = base_->video_device_->NumberOfDevices();
 
-  int32_t width = toInt(widthValue, DEFAULT_WIDTH);
-  int32_t height = toInt(heightValue, DEFAULT_HEIGHT);
-  int32_t fps = toInt(fpsValue, DEFAULT_FPS);
-
   for (int i = 0; i < nb_video_devices; i++) {
     base_->video_device_->GetDeviceName(i, strNameUTF8, 256, strGuidUTF8, 256);
-    if (sourceId != "" &&
-        sourceId ==
+    if (request.source_id != "" &&
+        request.source_id ==
             SanitizeDeviceIdFromVideoBuffers(strNameUTF8, strGuidUTF8)) {
-      video_capturer =
-          base_->video_device_->Create(strNameUTF8, i, width, height, fps);
+      camera.capturer = base_->video_device_->Create(
+          strNameUTF8, i, request.width, request.height, request.fps);
       break;
     }
   }
 
   if (nb_video_devices == 0)
-    return;
+    return camera;
 
-  if (!video_capturer.get()) {
+  if (!camera.capturer.get()) {
     base_->video_device_->GetDeviceName(0, strNameUTF8, 128, strGuidUTF8, 128);
-    sourceId = SanitizeDeviceIdFromVideoBuffers(strNameUTF8, strGuidUTF8);
-    video_capturer =
-        base_->video_device_->Create(strNameUTF8, 0, width, height, fps);
+    camera.source_id =
+        SanitizeDeviceIdFromVideoBuffers(strNameUTF8, strGuidUTF8);
+    camera.capturer = base_->video_device_->Create(
+        strNameUTF8, 0, request.width, request.height, request.fps);
   }
 
+  if (camera.capturer.get())
+    camera.capturer->StartCapture();
+
+  return camera;
+}
+
+void FlutterMediaStream::AttachCamera(const CameraRequest& request,
+                                      const OpenedCamera& camera,
+                                      scoped_refptr<RTCMediaStream> stream,
+                                      EncodableMap& params) {
+  scoped_refptr<RTCVideoCapturer> video_capturer = camera.capturer;
   if (!video_capturer.get())
     return;
-
-  video_capturer->StartCapture();
 
   const char* video_source_label = "video_input";
   scoped_refptr<RTCVideoSource> source = base_->factory_->CreateVideoSource(
       video_capturer, video_source_label,
-      base_->ParseMediaConstraints(video_constraints));
+      base_->ParseMediaConstraints(request.video_constraints));
 
   std::string uuid = base_->GenerateUUID();
   scoped_refptr<RTCVideoTrack> track =
@@ -417,11 +504,11 @@ void FlutterMediaStream::GetUserVideo(const EncodableMap& constraints,
 
   EncodableMap settings;
   settings[EncodableValue("deviceId")] =
-      EncodableValue(SanitizeUtf8ForFlutter(sourceId));
+      EncodableValue(SanitizeUtf8ForFlutter(camera.source_id));
   settings[EncodableValue("kind")] = EncodableValue("videoinput");
-  settings[EncodableValue("width")] = EncodableValue(width);
-  settings[EncodableValue("height")] = EncodableValue(height);
-  settings[EncodableValue("frameRate")] = EncodableValue(fps);
+  settings[EncodableValue("width")] = EncodableValue(request.width);
+  settings[EncodableValue("height")] = EncodableValue(request.height);
+  settings[EncodableValue("frameRate")] = EncodableValue(request.fps);
   info[EncodableValue("settings")] = EncodableValue(settings);
 
   videoTracks.push_back(EncodableValue(info));
@@ -431,6 +518,20 @@ void FlutterMediaStream::GetUserVideo(const EncodableMap& constraints,
 
   base_->local_tracks_[track->id().std_string()] = track;
   base_->video_capturers_[track->id().std_string()] = video_capturer;
+}
+
+void FlutterMediaStream::StopCapture(scoped_refptr<RTCVideoCapturer> capturer) {
+  if (base_->task_runner_ == nullptr) {
+    if (capturer->CaptureStarted()) {
+      capturer->StopCapture();
+    }
+    return;
+  }
+  CameraThread::Instance().Post([capturer]() {
+    if (capturer->CaptureStarted()) {
+      capturer->StopCapture();
+    }
+  });
 }
 
 void FlutterMediaStream::GetSources(std::unique_ptr<MethodResultProxy> result) {
@@ -601,10 +702,7 @@ void FlutterMediaStream::MediaStreamDispose(
     base_->local_tracks_.erase(track->id().std_string());
     if (base_->video_capturers_.find(track->id().std_string()) !=
         base_->video_capturers_.end()) {
-      auto video_capture = base_->video_capturers_[track->id().std_string()];
-      if (video_capture->CaptureStarted()) {
-        video_capture->StopCapture();
-      }
+      StopCapture(base_->video_capturers_[track->id().std_string()]);
       base_->video_capturers_.erase(track->id().std_string());
     }
   }
@@ -656,10 +754,7 @@ void FlutterMediaStream::MediaStreamTrackDispose(
 
         if (base_->video_capturers_.find(track_id) !=
             base_->video_capturers_.end()) {
-          auto video_capture = base_->video_capturers_[track_id];
-          if (video_capture->CaptureStarted()) {
-            video_capture->StopCapture();
-          }
+          StopCapture(base_->video_capturers_[track_id]);
           base_->video_capturers_.erase(track_id);
         }
       }

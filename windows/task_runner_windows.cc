@@ -54,11 +54,16 @@
    // Even though it would usually be sufficient to process only a single task
    // whenever we receive the message, if the message queue happens to be full,
    // we might not receive a message for each individual task.
+   // Tasks run without holding the lock: a task may block on a WebRTC thread
+   // that is itself enqueuing an event at that moment.
    for (;;) {
-     std::lock_guard<std::mutex> lock(tasks_mutex_);
-     if (tasks_.empty()) break;
-     TaskClosure task = tasks_.front();
-     tasks_.pop();
+     TaskClosure task;
+     {
+       std::lock_guard<std::mutex> lock(tasks_mutex_);
+       if (tasks_.empty()) break;
+       task = std::move(tasks_.front());
+       tasks_.pop();
+     }
      task();
    }
  }

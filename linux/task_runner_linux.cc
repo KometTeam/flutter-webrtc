@@ -16,10 +16,16 @@ void TaskRunnerLinux::EnqueueTask(TaskClosure task) {
         context,
         [](gpointer user_data)  -> gboolean {
           TaskRunnerLinux* runner = static_cast<TaskRunnerLinux*>(user_data);
-          std::lock_guard<std::mutex> lock(runner->tasks_mutex_);
-          while (!runner->tasks_.empty()) {
-            TaskClosure task = std::move(runner->tasks_.front());
-            runner->tasks_.pop();
+          // Tasks run without holding the lock: a task may block on a WebRTC
+          // thread that is itself enqueuing an event at that moment.
+          std::queue<TaskClosure> tasks;
+          {
+            std::lock_guard<std::mutex> lock(runner->tasks_mutex_);
+            std::swap(tasks, runner->tasks_);
+          }
+          while (!tasks.empty()) {
+            TaskClosure task = std::move(tasks.front());
+            tasks.pop();
             task();
           }
           return G_SOURCE_REMOVE;

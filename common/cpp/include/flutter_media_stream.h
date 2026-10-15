@@ -49,6 +49,30 @@ class FlutterMediaStream {
   void OnDeviceChange();
 
  private:
+  struct CameraRequest {
+    EncodableMap video_constraints;
+    std::string source_id;
+    int32_t width = 0;
+    int32_t height = 0;
+    int32_t fps = 0;
+  };
+
+  struct OpenedCamera {
+    scoped_refptr<RTCVideoCapturer> capturer;
+    std::string source_id;
+  };
+
+  CameraRequest ParseCameraRequest(const EncodableMap& constraints);
+
+  OpenedCamera OpenCamera(const CameraRequest& request);
+
+  void AttachCamera(const CameraRequest& request,
+                    const OpenedCamera& camera,
+                    scoped_refptr<RTCMediaStream> stream,
+                    EncodableMap& params);
+
+  void StopCapture(scoped_refptr<RTCVideoCapturer> capturer);
+
   FlutterWebRTCBase* base_;
 };
 
